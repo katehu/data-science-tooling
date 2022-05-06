@@ -18,9 +18,9 @@ There are two ways to open the jupyter notebook
   ```
   jupyter notebook
   ```
-  The jupyter notebook will be launched in your internet browser 
+  The jupyter notebook will be launched in your web browser 
   
-### Use Jupyter Notebook with R 
+### Link Jupyter Notebook with R 
 Jupyter is a web application for creating and sharing computational documents. It supports programming languages Python, Java, R, Julia, Matlab, Scala, etc., but it itslef does not provide these languages. To use them, we need to install the corresponding kernel for that language. To install the kernel for R:
 - Step 1. Install R 
 - Step 2. If you have installed the Anaconda, open the terminal and on the command line type 
@@ -31,10 +31,16 @@ Jupyter is a web application for creating and sharing computational documents. I
    ```
    conda install -c r r-irkernel
    ```
-Then open the jupyter book. Click on the "New" button and select R. Now you can start write a notebook with R. 
-<img width="1180" alt="Screen Shot 2022-05-06 at 1 45 35 PM" src="https://user-images.githubusercontent.com/14019327/167191122-9955ad18-2377-4b64-b950-4d4356287a52.png">
+- Step 3. Open the jupyter notebook. Click on the "New" button in the webpage and select R as shown below
+   <img width="1180" alt="Screen Shot 2022-05-06 at 1 45 35 PM" src="https://user-images.githubusercontent.com/14019327/167191122-9955ad18-2377-4b64-b950-4d4356287a52.png">
+- Now you can start writing a notebook with R 
+- If you have not installed Anaconda. You can also add R to Jupyter in an R console by following this instruction: https://irkernel.github.io/installation/
+- If you still have troubles, follow this [video](https://www.youtube.com/watch?v=SXBxKe8sK6I&ab_channel=MattMacarty)
+### How to Use Jupyter 
+See tutorial in this [video](https://www.youtube.com/watch?v=jZ952vChhuI&ab_channel=MichaelFudge). If you are an R user, simply replace the python command in this video to the R command you are familiar with. 
 
-- An alternative to the Step 2. We can also add R to Jupyter in an R console by following the instructions: https://irkernel.github.io/installation/
+
+
 
 
 ## For Advanced Users 
