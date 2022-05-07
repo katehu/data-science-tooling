@@ -45,4 +45,7 @@ See tutorial in this [video](https://www.youtube.com/watch?v=jZ952vChhuI&ab_chan
 
 ## For Advanced Users 
 ### Visual Studio + Jupyter Notebook 
-  https://www.youtube.com/watch?v=h1sAzPojKMg&t=3s&ab_channel=VisualStudioCode
+https://www.youtube.com/watch?v=h1sAzPojKMg&t=3s&ab_channel=VisualStudioCode
+  
+### Python + Latex
+https://github.com/connorferster/handcalcs
