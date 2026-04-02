@@ -1,0 +1,130 @@
+---
+title: "Lag data"
+format: pdf
+editor: visual
+---
+
+```{r}
+library(data.table)
+library(dplyr)
+library(terra)
+library(tidyr)
+
+# 1. Read fire data
+file_path <- "C:/Users/16144/Desktop/fire_final_2022.csv"
+df <- fread(file_path)
+df$DATE <- as.Date(df$DATE)
+
+
+# 2. Filter points
+# Conditions
+df_clean <- df %>%
+  filter(
+    IS_DAY1 == 1,
+    IS_FOREST == 1,
+    matched == TRUE,
+    Incid_Type == "Wildfire",
+    CONFIDENCE >= 60
+  )
+
+# Keep one point per event: choose the highest FRP point
+df_event1 <- df_clean %>%
+  group_by(Event_ID) %>%
+  slice_max(FRP, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    primary_id = row_number(),
+    fire_date = DATE
+  )
+
+
+# 3. Read tmmx
+tmmx <- rast("C:/Users/16144/Desktop/tmmx_2022.nc")
+cat("Number of tmmx layers:", nlyr(tmmx), "\n")
+
+
+# 4. Parse dates
+day_num <- as.numeric(sub(".*=", "", names(tmmx)))
+origin_date <- as.Date("1900-01-01")
+r_dates <- origin_date + day_num
+pts <- terra::vect(df_event1, geom = c("LONGITUDE", "LATITUDE"), crs = "EPSG:4326")
+
+
+# 5. Extract tmax
+get_tmax_for_lag <- function(lag_day, df_points, pts, tmmx, r_dates) {
+  
+  target_dates <- df_points$fire_date + lag_day
+  idx <- match(target_dates, r_dates)
+  
+  out <- data.frame(
+    primary_id = df_points$primary_id,
+    Event_ID   = df_points$Event_ID,
+    fire_date  = df_points$fire_date,
+    lag        = lag_day,
+    tmax       = NA_real_
+  )
+  
+  valid <- !is.na(idx)
+  
+  if (sum(valid) == 0) {
+    return(out)
+  }
+  
+  idx_valid <- idx[valid]
+  uniq_idx <- sort(unique(idx_valid))
+  
+  tmax_mat <- terra::extract(tmmx[[uniq_idx]], pts[valid])[, -1, drop = FALSE]
+  tmax_mat <- as.matrix(tmax_mat)
+  
+  row_pos <- seq_len(sum(valid))
+  col_pos <- match(idx_valid, uniq_idx)
+  
+  out$tmax[valid] <- tmax_mat[cbind(row_pos, col_pos)]
+  
+  out
+}
+
+
+# 6. Extract lags -7 to 7
+lags <- -7:7
+temp_long <- lapply(
+  lags,
+  get_tmax_for_lag,
+  df_points = df_event1,
+  pts = pts,
+  tmmx = tmmx,
+  r_dates = r_dates
+) %>%
+  bind_rows()
+
+# Kelvin to Celsius
+temp_long <- temp_long %>%
+  mutate(tmax_C = tmax - 273.15)
+
+
+# 7. Rename lag columns
+temp_long <- temp_long %>%
+  mutate(day_name = paste0("day_", lag))
+
+# 8. Convert format
+temp_wide <- temp_long %>%
+  select(primary_id, Event_ID, fire_date, day_name, tmax_C) %>%
+  pivot_wider(
+    names_from = day_name,
+    values_from = tmax_C
+  )
+
+wanted_cols <- c(
+  "primary_id", "Event_ID", "fire_date",
+  paste0("day_", -7:7)
+)
+
+wanted_cols <- wanted_cols[wanted_cols %in% names(temp_wide)]
+temp_wide <- temp_wide %>%
+  select(all_of(wanted_cols))
+
+
+# 9. Save output
+outfile <- "C:/Users/16144/Desktop/fire_lag+-7.csv"
+fwrite(temp_wide, outfile)
+```
