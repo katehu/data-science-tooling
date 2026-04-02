@@ -1,0 +1,350 @@
+---
+title: "Data collection"
+format: pdf
+editor: visual
+---
+
+```{r}
+library(sf)
+library(dplyr)
+library(lubridate)
+library(readr)
+library(terra)
+library(geosphere)
+library(data.table)
+library(tigris)
+
+options(tigris_use_cache = TRUE)
+
+
+# Input file paths
+## firms_shp <- "DL_FIRE_M-C61_687049/fire_archive_M-C61_687049.shp"
+## gridmet_nc <- "tmmx_2022.nc"
+## wc_path <- "wc2.1_2.5m_tavg"
+## tcc_tif <- "nlcd_tcc_CONUS_2022_v2023-5_wgs84/nlcd_tcc_conus_wgs84_v2023-5_20220101_20221231.tif"
+## nlcd_tif <- "Annual_NLCD_LndCov_2022_CU_C1V1/Annual_NLCD_LndCov_2022_CU_C1V1.tif"
+## mtbs_shp <- "mtbs_fod_pts_data/mtbs_FODpoints_DD.shp"
+
+# Output file
+final_outfile <- "C:/Users/16144/Desktop/fire_final_2022.csv"
+
+
+# Step 1: Read NASA FIRMS fire points
+fire_sf_raw <- st_read(firms_shp, quiet = TRUE)
+
+if (st_crs(fire_sf_raw)$epsg != 4326) {
+  fire_sf_raw <- st_transform(fire_sf_raw, 4326)
+}
+
+fire_df_raw <- fire_sf_raw %>%
+  st_drop_geometry() %>%
+  mutate(
+    DATE = as.Date(ACQ_DATE),
+    MONTH = month(DATE)
+  )
+
+
+# Step 2: Read GridMET + WorldClim + TCC
+gridmet_r <- rast(gridmet_nc)
+
+days <- as.Date("1900-01-01") + (44560:44924 - 1)
+
+wc_files <- sprintf("%s/wc2.1_2.5m_tavg_%02d.tif", wc_path, 1:12)
+wc_stack <- rast(wc_files)
+wc_resampled <- resample(wc_stack, gridmet_r[[1]], method = "bilinear")
+
+tcc <- rast(tcc_tif)
+forest_threshold <- 20
+
+all_results <- list()
+
+for (i in 1:365) {
+  day_date <- days[i]
+  month_i <- month(day_date)
+
+  fire_day <- fire_df_raw %>% filter(DATE == day_date)
+  if (nrow(fire_day) == 0) next
+
+  fire_v <- vect(
+    data.frame(x = fire_day$LONGITUDE, y = fire_day$LATITUDE),
+    geom = c("x", "y"),
+    crs = "EPSG:4326"
+  )
+
+  tmmx_day <- gridmet_r[[i]]
+  temps <- extract(tmmx_day, fire_v, method = "near", cells = TRUE)
+
+  wc_month <- wc_resampled[[month_i]]
+  clim_temps <- extract(wc_month, fire_v)[, 2]
+
+  tcc_extract <- extract(tcc, fire_v)
+  tcc_vals <- tcc_extract[,2]
+  tcc_vals <- as.numeric(tcc_vals)
+  is_forest <- ifelse(!is.na(tcc_vals) & tcc_vals >= forest_threshold, 1, 0)
+
+  cell_xy <- terra::xyFromCell(tmmx_day, temps$cell)
+
+  dist_m <- geosphere::distHaversine(
+    cbind(fire_day$LONGITUDE, fire_day$LATITUDE),
+    cell_xy
+  )
+
+  daily_df <- data.frame(
+    LATITUDE   = fire_day$LATITUDE,
+    LONGITUDE  = fire_day$LONGITUDE,
+    DATE       = fire_day$DATE,
+    MONTH      = fire_day$MONTH,
+    FRP        = fire_day$FRP,
+    TEMP       = temps[, 2],
+    CLIM_TEMP  = clim_temps,
+    TCC        = tcc_vals,
+    IS_FOREST  = is_forest,
+    CONFIDENCE = fire_day$CONFIDENCE,
+    BRIGHTNESS = fire_day$BRIGHTNESS,
+    BRIGHT_T31 = fire_day$BRIGHT_T31,
+    TYPE       = fire_day$TYPE,
+    CELL_LON   = cell_xy[, 1],
+    CELL_LAT   = cell_xy[, 2],
+    DIST_M     = dist_m
+  )
+
+  all_results[[length(all_results) + 1]] <- daily_df
+}
+
+fire_df <- bind_rows(all_results)
+
+
+# Step 3: Add NLCD land cover
+nlcd <- rast(nlcd_tif)
+
+pts <- vect(fire_df, geom = c("LONGITUDE", "LATITUDE"), crs = "EPSG:4326")
+pts_nlcd <- project(pts, crs(nlcd))
+ext <- terra::extract(nlcd, pts_nlcd)
+
+fire_df$nlcd_code <- ext[[2]]
+
+nlcd_lookup <- data.frame(
+  nlcd_code = c(11, 12, 21, 22, 23, 24, 31, 41, 42, 43, 52, 71, 81, 82, 90, 95),
+  nlcd_class = c(
+    "Open Water",
+    "Perennial Ice/Snow",
+    "Developed, Open Space",
+    "Developed, Low Intensity",
+    "Developed, Medium Intensity",
+    "Developed, High Intensity",
+    "Barren Land (Rock/Sand/Clay)",
+    "Deciduous Forest",
+    "Evergreen Forest",
+    "Mixed Forest",
+    "Shrub/Scrub",
+    "Grassland/Herbaceous",
+    "Pasture/Hay",
+    "Cultivated Crops",
+    "Woody Wetlands",
+    "Emergent Herbaceous Wetlands"
+  )
+)
+
+fire_df$nlcd_code <- as.numeric(as.character(fire_df$nlcd_code))
+fire_df <- fire_df %>%
+  left_join(nlcd_lookup, by = "nlcd_code")
+
+
+# Step 4: Match with MTBS events
+mtbs <- st_read(mtbs_shp, quiet = TRUE)
+
+mtbs_2022 <- mtbs %>%
+  filter(!is.na(Ig_Date)) %>%
+  filter(Ig_Date >= as.Date("2022-01-01") & Ig_Date < as.Date("2023-01-01"))
+
+fire_sf <- st_as_sf(
+  fire_df,
+  coords = c("LONGITUDE", "LATITUDE"),
+  crs = 4326,
+  remove = FALSE
+)
+
+fire_sf <- st_transform(fire_sf, 5070)
+mtbs_2022 <- st_transform(mtbs_2022, 5070)
+
+mtbs_2022$area_m2 <- mtbs_2022$BurnBndAc * 4046.86
+mtbs_2022$radius_m <- sqrt(mtbs_2022$area_m2 / pi) * 1.5
+
+fire_sf$matched <- FALSE
+fire_sf$Event_ID <- NA
+fire_sf$Incid_Type <- NA
+fire_sf$BurnBndAc <- NA
+fire_sf$Ig_Date_MTBS <- as.Date(NA)
+
+fire_dates <- as.Date(fire_sf$DATE)
+
+for (i in 1:nrow(mtbs_2022)) {
+  center <- mtbs_2022[i, ]
+
+  time_idx <- which(
+    fire_dates >= center$Ig_Date &
+    fire_dates <= center$Ig_Date + 30
+  )
+
+  if (length(time_idx) == 0) next
+
+  fire_subset <- fire_sf[time_idx, ]
+  dist <- st_distance(fire_subset, center)
+
+  match_idx <- which(as.numeric(dist) <= center$radius_m)
+
+  if (length(match_idx) > 0) {
+    idx_global <- time_idx[match_idx]
+
+    fire_sf$matched[idx_global] <- TRUE
+    fire_sf$Event_ID[idx_global] <- center$Event_ID
+    fire_sf$Incid_Type[idx_global] <- center$Incid_Type
+    fire_sf$BurnBndAc[idx_global] <- center$BurnBndAc
+    fire_sf$Ig_Date_MTBS[idx_global] <- center$Ig_Date
+  }
+}
+
+
+# Step 5: Add state information and temperature variables
+fire_sf_4326 <- st_transform(fire_sf, 4326)
+
+states_sf <- states(cb = TRUE, resolution = "20m") %>%
+  st_transform(4326) %>%
+  select(STATE_NAME = NAME, STATE_ABBR = STUSPS)
+
+fire_joined <- st_join(fire_sf_4326, states_sf, left = TRUE)
+
+final_df <- fire_joined %>%
+  mutate(
+    TEMP_C = TEMP - 273.15,
+    TEMP_ABS = TEMP_C - CLIM_TEMP
+  ) %>%
+  st_drop_geometry()
+
+
+# Step 7: Define fire events
+final_df$DATE <- as.Date(final_df$DATE)
+
+### Part A: Records with MTBS Event_ID
+df_mtbs <- final_df %>%
+  filter(!is.na(Event_ID)) %>%
+  group_by(Event_ID) %>%
+  mutate(
+    .FIRST_DAY = min(DATE, na.rm = TRUE),
+    DAYS_SINCE_START = as.integer(DATE - .FIRST_DAY),
+    IS_DAY1 = ifelse(DAYS_SINCE_START == 0, 1, 0)
+  ) %>%
+  ungroup() %>%
+  select(-.FIRST_DAY)
+
+### Part B: Records without MTBS Event_ID
+df_na <- final_df %>%
+  filter(is.na(Event_ID), !is.na(TCC), TCC >= 20) %>%
+  arrange(STATE_ABBR, DATE, LATITUDE, LONGITUDE)
+
+if (nrow(df_na) > 0) {
+  
+  df_na$.CLUSTER_ID <- NA_integer_
+  
+  time_window_days <- 7
+  space_window_m <- 3000
+  
+  start_date_all <- min(df_na$DATE, na.rm = TRUE)
+  
+  df_na <- df_na %>%
+    mutate(
+      .TIME_BLOCK = floor(as.numeric(DATE - start_date_all) / time_window_days)
+    )
+  
+  cluster_num <- 1
+  
+  state_block_keys <- df_na %>%
+    distinct(STATE_ABBR, .TIME_BLOCK) %>%
+    arrange(STATE_ABBR, .TIME_BLOCK)
+  
+  for (row_id in 1:nrow(state_block_keys)) {
+    
+    this_state <- state_block_keys$STATE_ABBR[row_id]
+    this_block <- state_block_keys$.TIME_BLOCK[row_id]
+    
+    idx_block <- which(
+      df_na$STATE_ABBR == this_state &
+      df_na$.TIME_BLOCK == this_block &
+      is.na(df_na$.CLUSTER_ID)
+    )
+    
+    if (length(idx_block) == 0) next
+    
+    block_df <- df_na[idx_block, , drop = FALSE]
+    block_df$.LOCAL_CLUSTER <- NA_integer_
+    
+    for (i in 1:nrow(block_df)) {
+      
+      if (!is.na(block_df$.LOCAL_CLUSTER[i])) next
+      
+      current_cluster <- cluster_num
+      block_df$.LOCAL_CLUSTER[i] <- current_cluster
+      
+      changed <- TRUE
+      
+      while (changed) {
+        changed <- FALSE
+        
+        cluster_idx <- which(block_df$.LOCAL_CLUSTER == current_cluster)
+        unassigned_idx <- which(is.na(block_df$.LOCAL_CLUSTER))
+        
+        if (length(unassigned_idx) == 0) break
+        
+        cluster_points <- cbind(
+          block_df$LONGITUDE[cluster_idx],
+          block_df$LATITUDE[cluster_idx]
+        )
+        
+        for (j in unassigned_idx) {
+          candidate_point <- c(block_df$LONGITUDE[j], block_df$LATITUDE[j])
+          dists <- geosphere::distHaversine(cluster_points, candidate_point)
+          
+          if (any(!is.na(dists) & dists <= space_window_m)) {
+            block_df$.LOCAL_CLUSTER[j] <- current_cluster
+            changed <- TRUE
+          }
+        }
+      }
+      
+      cluster_num <- cluster_num + 1
+    }
+    
+    df_na$.CLUSTER_ID[idx_block] <- block_df$.LOCAL_CLUSTER
+  }
+  
+  df_na <- df_na %>%
+    group_by(.CLUSTER_ID) %>%
+    mutate(
+      .FIRST_DAY = min(DATE, na.rm = TRUE),
+      DAYS_SINCE_START = as.integer(DATE - .FIRST_DAY),
+      IS_DAY1 = ifelse(DAYS_SINCE_START == 0, 1, 0)
+    ) %>%
+    ungroup() %>%
+    select(-.TIME_BLOCK, -.CLUSTER_ID, -.FIRST_DAY)
+  
+} else {
+  df_na <- final_df[0, ]
+}
+
+### Part C: Remaining records
+df_rest <- final_df %>%
+  anti_join(df_mtbs, by = names(final_df)) %>%
+  anti_join(df_na %>% select(names(final_df)), by = names(final_df)) %>%
+  mutate(
+    DAYS_SINCE_START = NA_integer_,
+    IS_DAY1 = NA_real_
+  )
+
+final_df_with_day1 <- bind_rows(df_mtbs, df_na, df_rest) %>%
+  arrange(DATE, LATITUDE, LONGITUDE)
+
+
+# Step 8: Export
+final_outfile_day1 <- "C:/Users/16144/Desktop/fire_final_2022.csv"
+write_csv(final_df_with_day1, final_outfile_day1)
+```
