@@ -1,0 +1,126 @@
+```{r}
+library(sf)
+library(dplyr)
+library(lubridate)
+library(readr)
+library(terra)
+
+# Input file paths
+firms_shp <- "C:/Users/16144/Desktop/DL_FIRE_M-C61_687049/fire_archive_M-C61_687049.shp"
+tmmx_dir  <- "C:/Users/16144/Desktop/tmmx"
+
+# Output file
+hist_outfile <- "C:/Users/16144/Desktop/fire_points_with_30yr_tmmx.csv"
+
+
+# Step 1: Read and prepare 2022 FIRMS fire points
+fire_sf_raw <- st_read(firms_shp, quiet = TRUE)
+
+if (st_crs(fire_sf_raw)$epsg != 4326) {
+  fire_sf_raw <- st_transform(fire_sf_raw, 4326)
+}
+
+fire_df_raw <- fire_sf_raw %>%
+  st_drop_geometry() %>%
+  mutate(
+    DATE = as.Date(ACQ_DATE),
+    MONTH = month(DATE),
+    primary_id = row_number(),
+    month_day = format(DATE, "%m-%d")
+  ) %>%
+  select(
+    primary_id,
+    LATITUDE,
+    LONGITUDE,
+    DATE,
+    MONTH,
+    month_day,
+    FRP,
+    CONFIDENCE,
+    BRIGHTNESS,
+    BRIGHT_T31,
+    TYPE,
+    everything()
+  )
+
+
+# Step 2: Extract same-location, same-date tmmx from 1991–2020
+hist_years <- 1991:2020
+
+hist_files <- file.path(tmmx_dir, paste0("tmmx_", hist_years, ".nc"))
+missing_files <- hist_files[!file.exists(hist_files)]
+
+if (length(missing_files) > 0) {
+  stop("Missing gridMET files:\n", paste(missing_files, collapse = "\n"))
+}
+
+# Output table: one row per 2022 fire point
+hist_temp_wide <- fire_df_raw %>%
+  select(primary_id, LONGITUDE, LATITUDE, DATE, MONTH, month_day)
+
+# Convert fire point coordinates to terra vector
+fire_v_all <- vect(
+  fire_df_raw[, c("LONGITUDE", "LATITUDE")],
+  geom = c("LONGITUDE", "LATITUDE"),
+  crs = "EPSG:4326"
+)
+
+for (yr in hist_years) {
+  
+  message("Processing year: ", yr)
+  
+  nc_file <- file.path(tmmx_dir, paste0("tmmx_", yr, ".nc"))
+  r_year <- rast(nc_file)
+  
+  # Match 2022 fire date to the same month-day in historical year
+  # Example: 2022-07-15 -> 1991-07-15
+  target_dates <- as.Date(paste0(yr, "-", fire_df_raw$month_day))
+  
+  # Convert date to NetCDF layer index
+  # Jan 1 = layer 1
+  layer_idx <- as.integer(target_dates - as.Date(paste0(yr, "-01-01"))) + 1
+  
+  valid_idx <- !is.na(layer_idx) & layer_idx >= 1 & layer_idx <= nlyr(r_year)
+  
+  temp_vals <- rep(NA_real_, nrow(fire_df_raw))
+  
+  # Extract by layer to reduce repeated raster reading
+  for (li in sort(unique(layer_idx[valid_idx]))) {
+    
+    row_idx <- which(valid_idx & layer_idx == li)
+    if (length(row_idx) == 0) next
+    
+    pts_sub <- fire_v_all[row_idx, ]
+    
+    ext_sub <- terra::extract(
+      r_year[[li]],
+      pts_sub,
+      method = "near"
+    )
+    
+    # gridMET tmmx is Kelvin, convert to Celsius
+    temp_vals[row_idx] <- ext_sub[, 2] - 273.15
+  }
+  
+  hist_temp_wide[[paste0("tmmx_", yr)]] <- temp_vals
+}
+
+
+# Calculate 30-year mean and 90th percentile
+temp_cols <- paste0("tmmx_", hist_years)
+
+hist_temp_wide <- hist_temp_wide %>%
+  rowwise() %>%
+  mutate(
+    tmmx_mean_30yr = mean(c_across(all_of(temp_cols)), na.rm = TRUE),
+    tmmx_p90_30yr  = quantile(
+      c_across(all_of(temp_cols)),
+      probs = 0.90,
+      na.rm = TRUE,
+      type = 7
+    )
+  ) %>%
+  ungroup()
+
+write_csv(hist_temp_wide, hist_outfile)
+```
