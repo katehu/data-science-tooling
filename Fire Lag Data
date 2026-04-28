@@ -10,14 +10,14 @@ library(dplyr)
 library(terra)
 library(tidyr)
 
+ 
 # 1. Read fire data
 file_path <- "C:/Users/16144/Desktop/fire_final_2022.csv"
 df <- fread(file_path)
 df$DATE <- as.Date(df$DATE)
 
-
+ 
 # 2. Filter points
-# Conditions
 df_clean <- df %>%
   filter(
     IS_DAY1 == 1,
@@ -37,24 +37,36 @@ df_event1 <- df_clean %>%
     fire_date = DATE
   )
 
+ 
+# 3. Read 2022 tmmx
+tmmx_2022 <- rast("C:/Users/16144/Desktop/tmmx_2022.nc")
+cat("Number of tmmx 2022 layers:", nlyr(tmmx_2022), "\n")
 
-# 3. Read tmmx
-tmmx <- rast("C:/Users/16144/Desktop/tmmx_2022.nc")
-cat("Number of tmmx layers:", nlyr(tmmx), "\n")
-
-
-# 4. Parse dates
-day_num <- as.numeric(sub(".*=", "", names(tmmx)))
+day_num_2022 <- as.numeric(sub(".*=", "", names(tmmx_2022)))
 origin_date <- as.Date("1900-01-01")
-r_dates <- origin_date + day_num
+r_dates_2022 <- origin_date + day_num_2022
+
+# Point geometry
 pts <- terra::vect(df_event1, geom = c("LONGITUDE", "LATITUDE"), crs = "EPSG:4326")
 
+ 
+# 4. Historical tmmx files (1991-2020)
+tmmx_dir <- "C:/Users/16144/Desktop/tmmx"
+hist_years <- 1991:2020
 
-# 5. Extract tmax
-get_tmax_for_lag <- function(lag_day, df_points, pts, tmmx, r_dates) {
+hist_files <- file.path(tmmx_dir, paste0("tmmx_", hist_years, ".nc"))
+missing_files <- hist_files[!file.exists(hist_files)]
+
+if (length(missing_files) > 0) {
+  stop("These historical tmmx files are missing:\n", paste(missing_files, collapse = "\n"))
+}
+
+ 
+# 5. Function: extract 2022 daily tmax for one lag
+get_tmax_for_lag <- function(lag_day, df_points, pts, tmmx_2022, r_dates_2022) {
   
   target_dates <- df_points$fire_date + lag_day
-  idx <- match(target_dates, r_dates)
+  idx <- match(target_dates, r_dates_2022)
   
   out <- data.frame(
     primary_id = df_points$primary_id,
@@ -73,7 +85,7 @@ get_tmax_for_lag <- function(lag_day, df_points, pts, tmmx, r_dates) {
   idx_valid <- idx[valid]
   uniq_idx <- sort(unique(idx_valid))
   
-  tmax_mat <- terra::extract(tmmx[[uniq_idx]], pts[valid])[, -1, drop = FALSE]
+  tmax_mat <- terra::extract(tmmx_2022[[uniq_idx]], pts[valid])[, -1, drop = FALSE]
   tmax_mat <- as.matrix(tmax_mat)
   
   row_pos <- seq_len(sum(valid))
@@ -84,47 +96,198 @@ get_tmax_for_lag <- function(lag_day, df_points, pts, tmmx, r_dates) {
   out
 }
 
+ 
+# 6. Function: extract 30-year same-day baseline for one lag
+get_hist_for_lag <- function(lag_day, df_points, pts, tmmx_dir, hist_years) {
+  
+  target_dates_2022 <- df_points$fire_date + lag_day
+  month_day <- format(target_dates_2022, "%m-%d")
+  
+  out <- data.frame(
+    primary_id = df_points$primary_id,
+    Event_ID   = df_points$Event_ID,
+    fire_date  = df_points$fire_date,
+    lag        = lag_day,
+    clim_avg   = NA_real_,
+    clim_p90   = NA_real_
+  )
+  
+  # Matrix to store 30 yearly values for each event point
+  hist_mat <- matrix(NA_real_, nrow = nrow(df_points), ncol = length(hist_years))
+  colnames(hist_mat) <- paste0("tmmx_", hist_years)
+  
+  for (k in seq_along(hist_years)) {
+    yr <- hist_years[k]
+    message("Lag ", lag_day, ": processing historical year ", yr)
+    
+    nc_file <- file.path(tmmx_dir, paste0("tmmx_", yr, ".nc"))
+    r_year <- rast(nc_file)
+    
+    # Same month-day in historical year
+    target_dates_hist <- as.Date(paste0(yr, "-", month_day))
+    
+    # Convert to layer index
+    layer_idx <- as.integer(target_dates_hist - as.Date(paste0(yr, "-01-01"))) + 1
+    
+    valid <- !is.na(layer_idx) & layer_idx >= 1 & layer_idx <= nlyr(r_year)
+    
+    if (sum(valid) == 0) next
+    
+    idx_valid <- layer_idx[valid]
+    uniq_idx <- sort(unique(idx_valid))
+    
+    ext_mat <- terra::extract(r_year[[uniq_idx]], pts[valid])[, -1, drop = FALSE]
+    ext_mat <- as.matrix(ext_mat)
+    
+    row_pos <- seq_len(sum(valid))
+    col_pos <- match(idx_valid, uniq_idx)
+    
+    vals <- rep(NA_real_, nrow(df_points))
+    vals[valid] <- ext_mat[cbind(row_pos, col_pos)] - 273.15   # Kelvin -> Celsius
+    
+    hist_mat[, k] <- vals
+  }
+  
+  out$clim_avg <- apply(hist_mat, 1, function(x) mean(x, na.rm = TRUE))
+  out$clim_p90 <- apply(hist_mat, 1, function(x) quantile(x, probs = 0.90, na.rm = TRUE, type = 7))
+  
+  out
+}
 
-# 6. Extract lags -7 to 7
+ 
+# 7. Extract lags -7 to 7
 lags <- -7:7
 temp_long <- lapply(
   lags,
   get_tmax_for_lag,
   df_points = df_event1,
   pts = pts,
-  tmmx = tmmx,
-  r_dates = r_dates
+  tmmx_2022 = tmmx_2022,
+  r_dates_2022 = r_dates_2022
 ) %>%
   bind_rows()
 
-# Kelvin to Celsius
-temp_long <- temp_long %>%
-  mutate(tmax_C = tmax - 273.15)
+hist_long <- lapply(
+  lags,
+  get_hist_for_lag,
+  df_points = df_event1,
+  pts = pts,
+  tmmx_dir = tmmx_dir,
+  hist_years = hist_years
+) %>%
+  bind_rows()
 
+ 
+# 8. Merge daily tmax + historical baseline
+lag_long <- temp_long %>%
+  left_join(
+    hist_long,
+    by = c("primary_id", "Event_ID", "fire_date", "lag")
+  )
 
-# 7. Rename lag columns
-temp_long <- temp_long %>%
-  mutate(day_name = paste0("day_", lag))
+# GridMET tmax: Kelvin -> Celsius
+lag_long <- lag_long %>%
+  mutate(
+    tmax_C   = tmax - 273.15,
+    abs_temp = tmax_C - clim_avg,
+    p90_diff = tmax_C - clim_p90,
+    hot_p90  = ifelse(!is.na(tmax_C) & !is.na(clim_p90) & tmax_C > clim_p90, 1, 0)
+  )
 
-# 8. Convert format
-temp_wide <- temp_long %>%
+ 
+# 9. Create column names
+lag_long <- lag_long %>%
+  mutate(
+    day_name      = paste0("day_", lag),
+    avg_name      = paste0("day_", lag, "_avg"),
+    p90_name      = paste0("day_", lag, "_p90"),
+    abs_name      = paste0("day_", lag, "_abs"),
+    p90diff_name  = paste0("day_", lag, "_p90diff"),
+    hot_name      = paste0("day_", lag, "_hot")
+  )
+
+ 
+# 10. Make wide table for daily tmax
+temp_wide <- lag_long %>%
   select(primary_id, Event_ID, fire_date, day_name, tmax_C) %>%
   pivot_wider(
     names_from = day_name,
     values_from = tmax_C
   )
 
+ 
+# 11. Wide table for 30-year mean
+avg_wide <- lag_long %>%
+  select(primary_id, Event_ID, fire_date, avg_name, clim_avg) %>%
+  pivot_wider(
+    names_from = avg_name,
+    values_from = clim_avg
+  )
+
+ 
+# 12. Wide table for 30-year p90
+p90_wide <- lag_long %>%
+  select(primary_id, Event_ID, fire_date, p90_name, clim_p90) %>%
+  pivot_wider(
+    names_from = p90_name,
+    values_from = clim_p90
+  )
+
+ 
+# 13. Table for anomaly
+anom_wide <- lag_long %>%
+  select(primary_id, Event_ID, fire_date, abs_name, abs_temp) %>%
+  pivot_wider(
+    names_from = abs_name,
+    values_from = abs_temp
+  )
+
+ 
+# 14. Wide table for p90 difference
+p90diff_wide <- lag_long %>%
+  select(primary_id, Event_ID, fire_date, p90diff_name, p90_diff) %>%
+  pivot_wider(
+    names_from = p90diff_name,
+    values_from = p90_diff
+  )
+
+ 
+# 15. Wide table for hot indicator
+hot_wide <- lag_long %>%
+  select(primary_id, Event_ID, fire_date, hot_name, hot_p90) %>%
+  pivot_wider(
+    names_from = hot_name,
+    values_from = hot_p90
+  )
+
+ 
+# 16. Merge all wide tables
+temp_wide <- temp_wide %>%
+  left_join(avg_wide, by = c("primary_id", "Event_ID", "fire_date")) %>%
+  left_join(p90_wide, by = c("primary_id", "Event_ID", "fire_date")) %>%
+  left_join(anom_wide, by = c("primary_id", "Event_ID", "fire_date")) %>%
+  left_join(p90diff_wide, by = c("primary_id", "Event_ID", "fire_date")) %>%
+  left_join(hot_wide, by = c("primary_id", "Event_ID", "fire_date"))
+
+ 
+# 17. Reorder columns
 wanted_cols <- c(
   "primary_id", "Event_ID", "fire_date",
-  paste0("day_", -7:7)
+  paste0("day_", -7:7),
+  paste0("day_", -7:7, "_avg"),
+  paste0("day_", -7:7, "_p90"),
+  paste0("day_", -7:7, "_abs"),
+  paste0("day_", -7:7, "_p90diff"),
+  paste0("day_", -7:7, "_hot")
 )
 
 wanted_cols <- wanted_cols[wanted_cols %in% names(temp_wide)]
+
 temp_wide <- temp_wide %>%
   select(all_of(wanted_cols))
 
-
-# 9. Save output
-outfile <- "C:/Users/16144/Desktop/fire_lag+-7.csv"
+ 
+# 18. Export
+outfile <- "C:/Users/16144/Desktop/fire_lag+-7_with_avg_p90.csv"
 fwrite(temp_wide, outfile)
 ```
